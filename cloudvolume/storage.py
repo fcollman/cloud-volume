@@ -1,6 +1,6 @@
 import six
 from six.moves import queue as Queue
-from collections import defaultdict
+from collections import defaultdict, deque
 import json
 import os.path
 import re
@@ -11,11 +11,11 @@ import botocore
 from glob import glob
 import google.cloud.exceptions
 from google.cloud.storage import Batch, Client
+import h2.exceptions
 import tenacity
 from tqdm import tqdm
 
-from . import compression
-from .exceptions import UnsupportedProtocolError
+from . import compression, exceptions
 from .lib import mkdir, extract_bucket_path, scatter
 from .threaded_queue import ThreadedQueue
 from .connectionpools import S3ConnectionPool, GCloudBucketPool, \
@@ -43,10 +43,11 @@ def reset_connection_pools():
 
 reset_connection_pools()
 
-retry = tenacity.retry(
-  reraise=True, 
-  stop=tenacity.stop_after_attempt(7), 
-  wait=tenacity.wait_random_exponential(0.5, 60.0),
+MAX_RETRIES = 7
+retry = partial(tenacity.retry,
+  reraise=True,
+  stop=tenacity.stop_after_attempt(MAX_RETRIES),
+  wait=tenacity.wait_random_exponential(0.5, 60.0)
 )
 
 DEFAULT_THREADS = 20
@@ -85,7 +86,7 @@ class SimpleStorage(object):
     elif self._path.protocol in ('http', 'https'):
       self._interface_cls = HttpInterface
     else:
-      raise UnsupportedProtocolError(str(self._path))
+      raise exceptions.UnsupportedProtocolError(str(self._path))
 
     self._interface = self._interface_cls(self._path)
 
@@ -246,7 +247,7 @@ class Storage(ThreadedQueue):
     elif self._path.protocol in ('http', 'https'):
       self._interface_cls = HttpInterface
     else:
-      raise UnsupportedProtocolError(str(self._path))
+      raise exceptions.UnsupportedProtocolError(str(self._path))
 
     self._interface = self._interface_cls(self._path)
 
@@ -664,21 +665,90 @@ class HttpInterface(object):
   def put_file(self, file_path, content, content_type, compress, cache_control=None):
     raise NotImplementedError()
 
-  @retry
+  @retry(retry=tenacity.retry_if_exception_type(exceptions.HTTPServerError))
   def get_file(self, file_path):
     key = self.get_path_to_file(file_path)
-    resp = self._conn.get(key)
-    resp.raise_for_status()
-    return resp.content, resp.encoding
+    self._conn.request('GET', key)
 
-  @retry
+    resp = self._conn.get_response()
+    err = exceptions.from_http_status(resp.status, resp.reason)
+    if isinstance(err, (exceptions.HTTPServerError, exceptions.HTTPClientError)):
+      resp.close()
+      raise err
+
+    result = resp.read()
+    resp.close()
+    return result, None  # content, encoding
+
+  @retry(retry=tenacity.retry_if_exception_type(exceptions.HTTPServerError))
   def exists(self, file_path):
     key = self.get_path_to_file(file_path)
-    resp = self._conn.head(key)
-    return resp.ok
+    self._conn.request('HEAD', key)
+
+    resp = self._conn.get_response()
+    err = exceptions.from_http_status(resp.status, resp.reason)
+    resp.close()
+
+    if isinstance(err, (exceptions.NotFound, exceptions.Forbidden)):
+      return False
+    elif isinstance(err, (exceptions.HTTPServerError, exceptions.HTTPClientError)):
+      raise err
+
+    return True
 
   def files_exist(self, file_paths):
-    return {path: self.exists(path) for path in file_paths}
+    available = list(file_paths)
+    running = deque()
+
+    def _send_next_request():
+      try:
+        file_path = available[-1]
+      except IndexError: # no further jobs available
+        return None
+
+      key = self.get_path_to_file(file_path)
+
+      try:
+        stream_id = self._conn.request('HEAD', key)
+      except h2.exceptions.TooManyStreamsError: # hit server limit
+        return None
+
+      running.append((file_path, stream_id))
+      del available[-1]
+
+      return stream_id
+
+    def _get_response(file_path, stream_id):
+      if stream_id is None:
+        resp = self._conn.get_response()
+      else:
+        resp = self._conn.get_response(stream_id)
+
+      err = exceptions.from_http_status(resp.status, resp.reason)
+      resp.close()
+      if isinstance(err, (exceptions.NotFound, exceptions.Forbidden)):
+        return False
+      elif isinstance(err, (exceptions.HTTPServerError)):
+        print("Repeatable Server Error")
+        return self.exists(file_path)
+      elif isinstance(err, (exceptions.HTTPClientError)):
+        print("Bad Client Error")
+        raise err
+      else:
+        return True
+
+    result = {file_path: None for file_path in file_paths}
+    stream_id = _send_next_request()
+
+    while running:
+      if stream_id is not None:
+        stream_id = _send_next_request()
+      else:
+        file_path, stream_id = running.popleft()
+        result[file_path] = _get_response(file_path, stream_id)
+        stream_id = _send_next_request()
+
+    return result
 
   def list_files(self, prefix, flat=False):
     raise NotImplementedError()
